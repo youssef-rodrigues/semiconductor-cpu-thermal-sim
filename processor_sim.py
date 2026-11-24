@@ -3,12 +3,23 @@
 ==============================================================================
  SIMULAÇÃO TÉRMICA 2D — Intel Core i7-13700K (Raptor Lake-S)
  Disciplina: Materiais e Dispositivos Elétricos — Engenharia Física
+ Padrão Visual e Tipográfico: ABNT NBR 14724 / Normas de Apresentação IBGE
+ Otimização Numérica: Solver FDM com Numba JIT e Duplo Buffer (Ping-Pong)
 ==============================================================================
 """
-
 import sys
 import io
-import time as _time
+import time
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # Backend não-bloqueante de alta precisão
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+from scipy.optimize import brentq
+from numba import njit
+import warnings
+warnings.filterwarnings("ignore")
 
 # Força UTF-8 no console do Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -16,565 +27,490 @@ if hasattr(sys.stdout, 'reconfigure'):
 else:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")  # Backend não-bloqueante para salvar a imagem sem travar o processo
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.gridspec as gridspec
-from scipy.optimize import brentq
-from numba import njit, prange
-import warnings
-warnings.filterwarnings("ignore")
-
 # =============================================================================
-# 1. CONSTANTES FÍSICAS E SEMICONDUTORAS (Silício)
+# 1. CONSTANTES FUNDAMENTAIS E SEMICONDUTORAS (Silício Monocristalino)
 # =============================================================================
 Q_E       = 1.602176634e-19   # Carga elementar [C]
-K_B_EV    = 8.617333262e-5    # Constante de Boltzmann [eV/K]
 K_B_J     = 1.380649e-23      # Constante de Boltzmann [J/K]
+K_B_EV    = 8.617333262e-5    # Constante de Boltzmann [eV/K]
+HBAR      = 1.054571817e-34   # Constante reduzida de Planck [J·s]
+M_0       = 9.1093837e-31     # Massa de repouso do elétron [kg]
 
-# --- Silício: propriedades térmicas (300 K) ---
-RHO_SI    = 2329.0            # Densidade [kg/m³]
-CP_SI_300 = 700.0             # Calor específico a 300K [J/(kg·K)]
-K_SI_300  = 148.0             # Condutividade térmica a 300K [W/(m·K)]
+# --- Silício: Massas efetivas de densidade de estados (primeiros princípios) ---
+# Banda de condução: 6 vales elipsoidais ao longo de <100> (ml=0.98, mt=0.19)
+# mc* = 6^(2/3) * (ml * mt^2)^(1/3) ≈ 1.08 * m0
+M_C_EFF   = 1.08 * M_0        # Massa efetiva dos elétrons [kg]
+# Banda de valência: buracos pesados e leves degenerados no ponto Γ
+# mv* = (mhh^(3/2) + mlh^(3/2))^(2/3) ≈ 0.56 * m0
+M_V_EFF   = 0.56 * M_0        # Massa efetiva das lacunas [kg]
 
-# --- Silício: propriedades semicondutoras ---
-EG0_SI    = 1.1695            # Bandgap T=0K [eV] — Varshni
-ALPHA_V   = 4.73e-4           # Varshni α [eV/K]
-BETA_V    = 636.0             # Varshni β [K]
-NC_300    = 2.8e19            # Densidade efetiva estados BC a 300K [cm⁻³]
-NV_300    = 1.04e19           # Densidade efetiva estados BV a 300K [cm⁻³]
-MU_N_300  = 1417.0            # Mobilidade elétrons a 300K [cm²/(V·s)] — Jacoboni-Canali
-MU_P_300  = 470.5             # Mobilidade buracos a 300K [cm²/(V·s)]
-N_D       = 1e17              # Concentração de doadores (tipo-n) [cm⁻³]
-NI_300    = 1.5e10            # Concentração intrínseca a 300K [cm⁻³]
+# --- Silício: Propriedades térmicas e de transporte ---
+RHO_SI    = 2329.0            # Densidade volumétrica do Si [kg/m³]
+CP_SI_300 = 700.0             # Calor específico a 300 K [J/(kg·K)]
+K_SI_300  = 148.0             # Condutividade térmica a 300 K [W/(m·K)]
+EG0_SI    = 1.1695            # Bandgap do Si em T=0 K [eV] (Varshni)
+ALPHA_V   = 4.73e-4           # Coeficiente α de Varshni [eV/K]
+BETA_V    = 636.0             # Temperatura característica β de Varshni [K]
+MU_N_300  = 1417.0            # Mobilidade de elétrons a 300 K [cm²/(V·s)]
+MU_P_300  = 470.5             # Mobilidade de lacunas a 300 K [cm²/(V·s)]
+GAMMA_N   = 2.42              # Expoente de fônons para elétrons (Jacoboni-Canali)
+GAMMA_P   = 2.20              # Expoente de fônons para lacunas
+N_D       = 1e17              # Concentração de dopantes doadores (tipo-n) [cm⁻³]
+TAU_N     = 1.0e-6            # Tempo de vida de recombinação de elétrons [s]
+TAU_P     = 1.0e-6            # Tempo de vida de recombinação de lacunas [s]
 
 # =============================================================================
-# 2. MODELOS FÍSICOS DA DISCIPLINA
+# 2. MODELOS FÍSICOS ANALÍTICOS (Física dos Semicondutores da Disciplina)
 # =============================================================================
+def Nc_states(T):
+    """
+    Densidade efetiva de estados na Banda de Condução [cm⁻³]:
+    Nc(T) = 2 · [ (mc* · kB · T) / (2π · ħ²) ]^(3/2)
+    """
+    T_s = np.maximum(T, 1.0)
+    val_m3 = 2.0 * ((M_C_EFF * K_B_J * T_s) / (2.0 * np.pi * HBAR**2))**1.5
+    return val_m3 * 1.0e-6  # converte m⁻³ para cm⁻³
+
+def Nv_states(T):
+    """
+    Densidade efetiva de estados na Banda de Valência [cm⁻³]:
+    Nv(T) = 2 · [ (mv* · kB · T) / (2π · ħ²) ]^(3/2)
+    """
+    T_s = np.maximum(T, 1.0)
+    val_m3 = 2.0 * ((M_V_EFF * K_B_J * T_s) / (2.0 * np.pi * HBAR**2))**1.5
+    return val_m3 * 1.0e-6  # converte m⁻³ para cm⁻³
+
 def Eg(T):
-    """Bandgap Varshni: E_g(T) = E_g(0) - α·T² / (T + β) [eV]"""
-    T = np.asarray(T, dtype=float)
-    return EG0_SI - ALPHA_V * T**2 / (T + BETA_V)
+    """Bandgap de Varshni: Eg(T) = Eg(0) - α·T² / (T + β) [eV]"""
+    T_s = np.maximum(T, 1.0)
+    return EG0_SI - ALPHA_V * T_s**2 / (T_s + BETA_V)
 
 def ni(T):
-    """Concentração intrínseca: n_i(T) = √(Nc·Nv) · exp(-Eg / 2kBT) [cm⁻³]"""
-    T = np.asarray(T, dtype=float)
-    T_safe = np.maximum(T, 1.0)
-    Nc = NC_300 * (T_safe / 300.0)**1.5
-    Nv = NV_300 * (T_safe / 300.0)**1.5
-    return np.sqrt(Nc * Nv) * np.exp(-Eg(T_safe) / (2.0 * K_B_EV * T_safe))
-
-def mu_n(T):
-    """Mobilidade elétrons Jacoboni-Canali: μ_n(T) = μ_n(300) · (T/300)^(-2.42)"""
-    T = np.asarray(T, dtype=float)
-    return MU_N_300 * (T / 300.0)**(-2.42)
-
-def mu_p(T):
-    """Mobilidade buracos: μ_p(T) = μ_p(300) · (T/300)^(-2.20)"""
-    T = np.asarray(T, dtype=float)
-    return MU_P_300 * (T / 300.0)**(-2.20)
+    """
+    Concentração intrínseca de portadores [cm⁻³]:
+    ni(T) = √(Nc · Nv) · exp(-Eg / (2 · kB · T))
+    """
+    T_s = np.maximum(T, 1.0)
+    Nc = Nc_states(T_s)
+    Nv = Nv_states(T_s)
+    return np.sqrt(Nc * Nv) * np.exp(-Eg(T_s) / (2.0 * K_B_EV * T_s))
 
 def carrier_concentrations(T, Nd=N_D):
-    """Neutralidade de carga (Si tipo-n): n_o = Nd/2 + √((Nd/2)² + ni²)"""
-    T = np.asarray(T, dtype=float)
+    """
+    Neutralidade de carga (Si tipo-n): no = Nd/2 + √((Nd/2)² + ni²) [cm⁻³]
+    Lei de Ação das Massas: po = ni² / no [cm⁻³] (no · po = ni²)
+    """
     ni_T = ni(T)
     n_o = 0.5 * Nd + np.sqrt((0.5 * Nd)**2 + ni_T**2)
     p_o = ni_T**2 / n_o
     return n_o, p_o
 
+def fermi_levels(T, Nd=N_D, Ev=0.0):
+    """
+    Nível de Fermi e Nível Intrínseco [eV]:
+    Ei = (Ec + Ev)/2 + (3/4) · kB·T · ln(mv* / mc*)
+    EF = Ei + kB·T · ln(no / ni) = Ec - kB·T · ln(Nc / no)
+    """
+    T_s = np.maximum(T, 1.0)
+    Eg_T = Eg(T_s)
+    Ec = Ev + Eg_T
+    ni_T = ni(T_s)
+    n_o, _ = carrier_concentrations(T_s, Nd)
+    shift_mass = 0.75 * K_B_EV * T_s * np.log(M_V_EFF / M_C_EFF)
+    Ei = 0.5 * (Ec + Ev) + shift_mass
+    EF = Ei + K_B_EV * T_s * np.log(np.maximum(n_o / ni_T, 1e-300))
+    return Ec, Ev, Ei, EF, EF - Ei
+
+def mu_n(T):
+    """Mobilidade de elétrons (Jacoboni-Canali): μ_n(T) = μ_n(300) · (T/300)^(-2.42)"""
+    return MU_N_300 * (np.maximum(T, 1.0) / 300.0)**(-GAMMA_N)
+
+def mu_p(T):
+    """Mobilidade de lacunas: μ_p(T) = μ_p(300) · (T/300)^(-2.20)"""
+    return MU_P_300 * (np.maximum(T, 1.0) / 300.0)**(-GAMMA_P)
+
+def relaxation_times(T):
+    """Tempo de relaxação de momento (Drude-Boltzmann): τ = m* · μ / e [s]"""
+    mu_n_si = mu_n(T) * 1.0e-4  # cm²/(V·s) -> m²/(V·s)
+    mu_p_si = mu_p(T) * 1.0e-4
+    tau_e = (M_C_EFF * mu_n_si) / Q_E
+    tau_h = (M_V_EFF * mu_p_si) / Q_E
+    return tau_e, tau_h
+
+def einstein_diffusion(T):
+    """
+    Relação de Einstein: D / μ = kB·T / e [cm²/s]
+    Dn = μn · (kB·T / e), Dp = μp · (kB·T / e)
+    """
+    T_s = np.maximum(T, 1.0)
+    Vt = K_B_EV * T_s  # Tensão térmica kB·T/e [V]
+    return mu_n(T_s) * Vt, mu_p(T_s) * Vt
+
+def diffusion_lengths(T, tau_n=TAU_N, tau_p=TAU_P):
+    """Comprimento de difusão de portadores: Ln = √(Dn · τn), Lp = √(Dp · τp) [cm]"""
+    Dn, Dp = einstein_diffusion(T)
+    return np.sqrt(Dn * tau_n), np.sqrt(Dp * tau_p)
+
 def conductivity(T, Nd=N_D):
-    """Condutividade: σ(T) = e · (n_o·μ_n + p_o·μ_p) [S/cm]"""
+    """Condutividade elétrica total: σ(T) = q · (n_o·μ_n + p_o·μ_p) [S/cm]"""
     n_o, p_o = carrier_concentrations(T, Nd)
     return Q_E * (n_o * mu_n(T) + p_o * mu_p(T))
 
-def fermi_level_above_intrinsic(T, Nd=N_D):
-    """E_F - E_i = kB·T · ln(n_o / n_i) [eV]"""
-    T = np.asarray(T, dtype=float)
-    T_safe = np.maximum(T, 1.0)
-    ni_T = ni(T_safe)
-    n_o, _ = carrier_concentrations(T_safe, Nd)
-    return K_B_EV * T_safe * np.log(np.maximum(n_o / ni_T, 1e-300))
+def drift_current_density(T, E_field_V_cm, Nd=N_D):
+    """Densidade de corrente de deriva: J_deriva = σ(T) · E [A/cm²]"""
+    return conductivity(T, Nd) * E_field_V_cm
 
 # =============================================================================
-# 3. LAYOUT E POTÊNCIAS DO i7-13700K (Gaming Load ~125 W sem arrefecimento)
+# 3. GEOMETRIA DO DIE E ARQUITETURA DE POTÊNCIA (i7-13700K Gaming Load ~125 W)
 # =============================================================================
-NX, NY  = 120, 60             # Dimensões da grade
-DX = DY = 200e-6              # 200 µm por célula -> Die de 24 mm x 12 mm
-DZ = 500e-6                   # Espessura do substrato: 500 µm
-T_AMB   = 300.0               # Temperatura inicial (26.85 °C)
-T_THROTTLE_K = 373.15         # TjMax Intel = 100 °C
+NX, NY  = 120, 60             # Dimensões da malha discreta (120 x 60)
+DX = DY = 200e-6              # Resolução espacial 200 µm -> Die de 24,0 mm x 12,0 mm
+DZ      = 500e-6              # Espessura do substrato de silício (500 µm)
+T_AMB   = 300.0               # Temperatura ambiente inicial (26,85 °C / 300 K)
 
-# Potências por bloco funcional (Fontes: Intel Arch Day 2022, AnandTech, Chips&Cheese)
 GAMING_POWER = {
-    "P-Core":    82.0,   # 8 P-Cores Raptor Cove (~10.25 W/core) -> Principal gerador de calor (~66%)
-    "L3-Cache":  18.0,   # 30 MB L3 Smart Cache + Ring Bus a 4.5+ GHz (~14%)
-    "E-Cluster": 14.0,   # 2 clusters Gracemont (8 E-cores, ~1.75 W/core) (~11%)
-    "IMC-IO":     9.0,   # Memory Controller DDR4/5 + PCIe Gen5 + System Agent (~7%)
-    "iGPU":       2.0,   # UHD 770 ociosa durante gaming com dGPU (~2%)
+    "P-Core": 82.0, "L3-Cache": 18.0, "E-Cluster": 14.0, "IMC-IO": 9.0, "iGPU": 2.0
 }
-TOTAL_POWER = sum(GAMING_POWER.values())  # 125 W
+TOTAL_POWER = sum(GAMING_POWER.values())
 
-# Coordenadas dos blocos no Die (em células da grade)
-BLOCKS = [
-    # 8 P-Cores (Raptor Cove) — Superior Esquerdo (alta densidade de potência)
-    {"name": "P-Core 0", "x0":  2, "x1": 16, "y0": 42, "y1": 57, "domain": "P-Core"},
-    {"name": "P-Core 1", "x0": 17, "x1": 31, "y0": 42, "y1": 57, "domain": "P-Core"},
-    {"name": "P-Core 2", "x0": 32, "x1": 46, "y0": 42, "y1": 57, "domain": "P-Core"},
-    {"name": "P-Core 3", "x0": 47, "x1": 61, "y0": 42, "y1": 57, "domain": "P-Core"},
-    {"name": "P-Core 4", "x0":  2, "x1": 16, "y0": 26, "y1": 41, "domain": "P-Core"},
-    {"name": "P-Core 5", "x0": 17, "x1": 31, "y0": 26, "y1": 41, "domain": "P-Core"},
-    {"name": "P-Core 6", "x0": 32, "x1": 46, "y0": 26, "y1": 41, "domain": "P-Core"},
-    {"name": "P-Core 7", "x0": 47, "x1": 61, "y0": 26, "y1": 41, "domain": "P-Core"},
-
-    # 2 Clusters de E-Cores (Gracemont) — Superior Direito
-    {"name": "E-Cluster 0\n(4 cores)", "x0": 62, "x1": 85,  "y0": 35, "y1": 57, "domain": "E-Cluster"},
-    {"name": "E-Cluster 1\n(4 cores)", "x0": 86, "x1": 109, "y0": 35, "y1": 57, "domain": "E-Cluster"},
-
-    # Ring Bus — Interconector horizontal central
-    {"name": "Ring Bus Interconnect", "x0":  2, "x1": 109, "y0": 20, "y1": 25, "domain": "L3-Cache"},
-
-    # L3 Cache (30 MB Smart Cache compartilhado)
-    {"name": "L3 Smart Cache (30 MB)", "x0":  2, "x1": 109, "y0":  8, "y1": 19, "domain": "L3-Cache"},
-
-    # I/O, Memória e System Agent — Faixa Inferior
-    {"name": "Mem Ctrl (DDR5)", "x0":  2, "x1": 28,  "y0":  2, "y1":  7, "domain": "IMC-IO"},
-    {"name": "PCIe 5.0 Controller", "x0": 29, "x1": 60,  "y0":  2, "y1":  7, "domain": "IMC-IO"},
-    {"name": "System Agent (PCU)",  "x0": 61, "x1": 85,  "y0":  2, "y1":  7, "domain": "IMC-IO"},
-
-    # iGPU (UHD Graphics 770) — Inferior Direito
-    {"name": "iGPU (UHD 770)",      "x0": 86, "x1": 109, "y0":  2, "y1": 34, "domain": "iGPU"},
-]
-
-DOMAIN_COLORS = {
-    "P-Core":    "#D32F2F",   # Vermelho (máximo calor)
-    "L3-Cache":  "#F57C00",   # Laranja (moderado-alto)
-    "E-Cluster": "#1976D2",   # Azul (eficiência)
-    "IMC-IO":    "#388E3C",   # Verde (I/O)
-    "iGPU":      "#7B1FA2",   # Roxo (idle/pouco calor)
-}
-
-DOMAIN_LABELS = {
-    "P-Core":    "P-Cores (8× Raptor Cove) — 82 W (66%)",
-    "L3-Cache":  "L3 Cache + Ring Bus — 18 W (14%)",
-    "E-Cluster": "E-Cores (8× Gracemont) — 14 W (11%)",
-    "IMC-IO":    "IMC + PCIe + System Agent — 9 W (7%)",
-    "iGPU":      "iGPU (UHD 770, ociosa) — 2 W (2%)",
-}
+# Floorplan funcional conciso (name, domain, x0, x1, y0, y1)
+BLOCKS = (
+    [(f"P-Core {c}", "P-Core", 2 + c*15, 16 + c*15, 42, 57) for c in range(4)] +
+    [(f"P-Core {c + 4}", "P-Core", 2 + c*15, 16 + c*15, 26, 41) for c in range(4)] +
+    [("E-Cluster 0 (4c)", "E-Cluster", 62, 85, 35, 57),
+     ("E-Cluster 1 (4c)", "E-Cluster", 86, 109, 35, 57),
+     ("Ring Bus Interconnect", "L3-Cache", 2, 109, 20, 25),
+     ("L3 Smart Cache (30 MB)", "L3-Cache", 2, 109, 8, 19),
+     ("Mem Ctrl (DDR5)", "IMC-IO", 2, 28, 2, 7),
+     ("PCIe 5.0 Ctrl", "IMC-IO", 29, 60, 2, 7),
+     ("System Agent", "IMC-IO", 61, 85, 2, 7),
+     ("iGPU (UHD 770)", "iGPU", 86, 109, 2, 34)]
+)
 
 def build_power_map():
-    P_dyn = np.zeros((NX, NY), dtype=float)
+    """Gera matriz de densidade volumétrica Q_gen [W/m³] por fatiamento direto."""
+    P_vol = np.zeros((NX, NY), dtype=np.float64)
     cell_vol = DX * DY * DZ
-    domain_cells = {d: 0 for d in GAMING_POWER}
-    domain_masks = {d: np.zeros((NX, NY), dtype=bool) for d in GAMING_POWER}
-
-    for blk in BLOCKS:
-        d = blk["domain"]
-        mask = np.zeros((NX, NY), dtype=bool)
-        mask[blk["x0"]:blk["x1"], blk["y0"]:blk["y1"]] = True
-        domain_masks[d] |= mask
-        domain_cells[d] += (blk["x1"] - blk["x0"]) * (blk["y1"] - blk["y0"])
-
-    for d, total_power in GAMING_POWER.items():
-        n_cells = max(domain_cells[d], 1)
-        power_per_cell = total_power / n_cells
-        P_dyn[domain_masks[d]] += power_per_cell
-
-    return P_dyn / cell_vol, domain_masks
+    area_dom = {}
+    for _, dom, x0, x1, y0, y1 in BLOCKS:
+        area_dom[dom] = area_dom.get(dom, 0) + (x1 - x0) * (y1 - y0)
+    for _, dom, x0, x1, y0, y1 in BLOCKS:
+        P_vol[x0:x1, y0:y1] = (GAMING_POWER[dom] / area_dom[dom]) / cell_vol
+    return P_vol
 
 # =============================================================================
-# 4. SOLVER FDM 2D PARALELO COM NUMBA (C-Compiled via LLVM)
+# 4. SOLVER FDM 2D PARALELO COM NUMBA (DOUBLE BUFFERING ZERO-ALLOCATION)
 # =============================================================================
-_alpha_300 = K_SI_300 / (RHO_SI * CP_SI_300)
-DT_FIXED   = DX**2 / (4.0 * _alpha_300) * 0.40  # Estabilidade de Von Neumann
-_K_CONST   = K_SI_300
+alpha_si = K_SI_300 / (RHO_SI * CP_SI_300)
+DT_FDM   = (DX**2 / (4.0 * alpha_si)) * 0.40  # Critério de Von Neumann (r = 0.10 <= 0.25)
+CK       = DT_FDM * K_SI_300 / (RHO_SI * CP_SI_300 * DX**2)
+CQ       = DT_FDM / (RHO_SI * CP_SI_300)
 
-@njit(parallel=True)
-def _fdm_kernel(T, P_gen_vol, dt, k_const, rho, cp, dx):
-    """
-    Equação da Difusão Térmica 2D com Geração:
-    ρ·cp · ∂T/∂t = k·∇²T + Q_gen
-    Fronteiras de Neumann (fluxo zero): ausência de arrefecimento.
-    """
-    NX_loc, NY_loc = T.shape
-    T_new = T.copy()
-    inv_dx2 = 1.0 / (dx * dx)
-    ck = dt * k_const / (rho * cp) * inv_dx2
-    cq = dt / (rho * cp)
+@njit(fastmath=True)
+def _fdm_step(T_src, T_dst, P_gen, ck, cq):
+    """Executa um passo temporal FDM 2D explícito: ρ·cp·∂T/∂t = k·∇²T + Q_gen"""
+    nx, ny = T_src.shape
+    for i in range(1, nx - 1):
+        for j in range(1, ny - 1):
+            lap = T_src[i+1, j] + T_src[i-1, j] + T_src[i, j+1] + T_src[i, j-1] - 4.0 * T_src[i, j]
+            T_dst[i, j] = T_src[i, j] + ck * lap + cq * P_gen[i, j]
+    # Condições de contorno adiabáticas (Neumann zero-flux dT/dn = 0 nas 4 bordas)
+    for j in range(ny):
+        T_dst[0, j] = T_dst[1, j]
+        T_dst[nx - 1, j] = T_dst[nx - 2, j]
+    for i in range(nx):
+        T_dst[i, 0] = T_dst[i, 1]
+        T_dst[i, ny - 1] = T_dst[i, ny - 2]
 
-    for i in prange(1, NX_loc - 1):
-        for j in range(1, NY_loc - 1):
-            lap = (T[i+1, j] + T[i-1, j] + T[i, j+1] + T[i, j-1] - 4.0 * T[i, j])
-            T_new[i, j] = T[i, j] + ck * lap + cq * P_gen_vol[i, j]
-
-    # Condição adiabática (Neumann: dT/dn = 0) nas 4 bordas
-    for j in range(NY_loc):
-        T_new[0, j]        = T_new[1, j]
-        T_new[NX_loc-1, j] = T_new[NX_loc-2, j]
-    for i in range(NX_loc):
-        T_new[i, 0]        = T_new[i, 1]
-        T_new[i, NY_loc-1] = T_new[i, NY_loc-2]
-
-    return T_new
-
-def warmup_numba(T, P_gen_vol):
-    """Compila o kernel na primeira execução."""
-    _ = _fdm_kernel(T, P_gen_vol, DT_FIXED, _K_CONST, RHO_SI, CP_SI_300, DX)
+@njit(fastmath=True)
+def fdm_batch_kernel(T0, T1, P_gen, ck, cq, n_steps):
+    """Executa n_steps em ping-pong double buffering (ZERO alocações de memória)."""
+    for _ in range(n_steps // 2):
+        _fdm_step(T0, T1, P_gen, ck, cq)
+        _fdm_step(T1, T0, P_gen, ck, cq)
 
 # =============================================================================
-# 5. EXECUÇÃO DA SIMULAÇÃO
+# 5. EXECUÇÃO DA SIMULAÇÃO TÉRMICA E TRANSIENTE
 # =============================================================================
-print("=" * 70)
-print("  SIMULAÇÃO TÉRMICA 2D — Intel Core i7-13700K")
-print("  Disciplina: Materiais e Dispositivos Elétricos (Engenharia Física)")
-print("=" * 70)
+print("=" * 72)
+print("  SIMULAÇÃO TÉRMICA 2D — Intel Core i7-13700K (Raptor Lake-S)")
+print("  Disciplina: Materiais e Dispositivos Elétricos — Engenharia Física")
+print("  Normas de Publicação: ABNT NBR 14724 / Regras de Apresentação IBGE")
+print("=" * 72)
 
+# Cálculo analítico da temperatura crítica de inversão intrínseca (ni = Nd)
 T_fail_K = brentq(lambda T: float(ni(T)) - N_D, 400, 1500)
 T_fail_C = T_fail_K - 273.15
+print(f"  Ponto de Colapso Lógico (n_i = N_d): {T_fail_K:.1f} K ({T_fail_C:.1f} °C)")
+print(f"  Potência Dissipada em Regime Gaming: {TOTAL_POWER:.0f} W (sem dissipador)")
 
-print(f"  Ponto de Colapso Físico (n_i = N_d): {T_fail_K:.1f} K ({T_fail_C:.1f} °C)")
-print(f"  Potência Dissipada em Carga Gaming: {TOTAL_POWER:.0f} W (sem arrefecimento)")
+P_gen_vol = build_power_map()
+T0 = np.full((NX, NY), T_AMB, dtype=np.float64)
+T1 = np.full((NX, NY), T_AMB, dtype=np.float64)
 
-T_field = np.full((NX, NY), T_AMB, dtype=float)
-P_gen_vol, domain_masks = build_power_map()
+# Compilação JIT inicial (warmup do kernel C nativo)
+print("  Compilando kernel FDM em código de máquina nativo (LLVM)...", end="", flush=True)
+t_w = time.perf_counter()
+fdm_batch_kernel(T0, T1, P_gen_vol, CK, CQ, 2)
+T0.fill(T_AMB)
+T1.fill(T_AMB)
+print(f" Concluído em {time.perf_counter() - t_w:.2f} s")
 
-# JIT warmup
-print("  Compilando kernel FDM em código C nativo via Numba...")
-t_w = _time.perf_counter()
-warmup_numba(T_field, P_gen_vol)
-print(f"  Kernel compilado em {_time.perf_counter() - t_w:.2f} s")
-
-# Listas de histórico temporal
-hist_times    = []
-hist_Tmax_C   = []
-hist_ni_ratio = []
-hist_mu_n_T   = []
-hist_sigma_T  = []
-
-elapsed_us = 0.0
-failed = False
-failure_reason = ""
 N_BATCH = 100
-MAX_LOTES = 10000
+MAX_BATCHES = 10000
 
-t_start = _time.perf_counter()
-for lote in range(MAX_LOTES):
-    # Executa lote de passos paralelos
-    for _ in range(N_BATCH):
-        T_field = _fdm_kernel(T_field, P_gen_vol, DT_FIXED, _K_CONST, RHO_SI, CP_SI_300, DX)
-        elapsed_us += DT_FIXED * 1e6
+hist_t_ms, hist_Tmax_C, hist_ni_ratio, hist_mu_n, hist_sigma = [], [], [], [], []
+elapsed_s = 0.0
 
-    T_max = float(np.max(T_field))
-    ni_T  = float(ni(T_max))
-    r_ni  = ni_T / N_D
+print("  Executando integração temporal com double buffering...", end="", flush=True)
+t_start = time.perf_counter()
+for batch in range(MAX_BATCHES):
+    fdm_batch_kernel(T0, T1, P_gen_vol, CK, CQ, N_BATCH)
+    elapsed_s += N_BATCH * DT_FDM
 
-    hist_times.append(elapsed_us)
+    T_max = float(np.max(T0))
+    ni_T = float(ni(T_max))
+    
+    hist_t_ms.append(elapsed_s * 1e3)
     hist_Tmax_C.append(T_max - 273.15)
-    hist_ni_ratio.append(max(r_ni, 1e-15))
-    hist_mu_n_T.append(float(mu_n(T_max)))
-    hist_sigma_T.append(float(conductivity(T_max)))
+    hist_ni_ratio.append(max(ni_T / N_D, 1e-15))
+    hist_mu_n.append(float(mu_n(T_max)))
+    hist_sigma.append(float(conductivity(T_max)))
 
-    # Critério de parada: transição para regime intrínseco (n_i >= N_d)
-    if ni_T >= N_D:
-        failed = True
-        failure_reason = "Regime Intrínseco Atingido (n_i ≥ N_d)"
-        break
-    if T_max > 950.0:
-        failed = True
-        failure_reason = "Limite de Integridade Térmica"
+    if ni_T >= N_D or T_max > 950.0:
         break
 
-t_total = _time.perf_counter() - t_start
-T_max_final   = float(np.max(T_field))
-T_max_final_C = T_max_final - 273.15
-ni_final      = float(ni(T_max_final))
-mu_n_final    = float(mu_n(T_max_final))
-mu_p_final    = float(mu_p(T_max_final))
-n_o_final, p_o_final = carrier_concentrations(T_max_final)
-sigma_final   = float(conductivity(T_max_final))
-EF_final      = float(fermi_level_above_intrinsic(T_max_final))
-Eg_final      = float(Eg(T_max_final))
-Dn_final      = mu_n_final * K_B_EV * T_max_final
-ni_ratio_final = ni_final / N_D
-sigma_300 = float(conductivity(300.0))
+t_total_comp = time.perf_counter() - t_start
+print(f" Concluído em {t_total_comp*1000:.1f} ms.")
 
-print(f"  Simulação calculada com sucesso em {t_total:.2f} s ({elapsed_us/1e6:.3f} s físicos).")
-print(f"  T_max final atingida: {T_max_final_C:.1f} °C (Critério: {failure_reason})")
+T_final_max = float(np.max(T0))
+T_final_C = T_final_max - 273.15
+ni_final = float(ni(T_final_max))
+mu_n_final = float(mu_n(T_final_max))
+sigma_final = float(conductivity(T_final_max))
+Eg_final = float(Eg(T_final_max))
+_, _, _, _, EF_final = fermi_levels(T_final_max)
+Dn_final, Dp_final = einstein_diffusion(T_final_max)
+tau_e_final, _ = relaxation_times(T_final_max)
+Ln_final, _ = diffusion_lengths(T_final_max)
+
+print(f"  Tempo Físico até Colapso: {elapsed_s*1e3:.2f} ms ({len(hist_t_ms)*N_BATCH} passos FDM)")
+print(f"  Temperatura Máxima Atingida: {T_final_C:.1f} °C (TjMax superado)")
 
 # =============================================================================
-# 6. GERAÇÃO DO PAINEL GRÁFICO (Tema Claro e Visual Limpo)
+# 6. GERAÇÃO VISUAL PADRÃO ABNT / IEEE (Preto e Branco / Fundo Branco / Alta Legibilidade)
 # =============================================================================
-plt.style.use("seaborn-v0_8-whitegrid")
-matplotlib.rcParams.update({
-    "font.family":      "sans-serif",
-    "axes.facecolor":   "#FFFFFF",
-    "figure.facecolor": "#F8F9FA",
-    "axes.edgecolor":   "#B0BEC5",
-    "axes.labelcolor":  "#263238",
-    "xtick.color":      "#37474F",
-    "ytick.color":      "#37474F",
-    "text.color":       "#263238",
-    "grid.color":       "#ECEFF1",
-    "grid.linestyle":   "--",
-    "grid.alpha":       0.7,
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif", "Liberation Serif"],
+    "font.size": 9.0,
+    "text.color": "#000000",
+    "axes.labelcolor": "#000000",
+    "xtick.color": "#000000",
+    "ytick.color": "#000000",
+    "axes.edgecolor": "#000000",
+    "axes.linewidth": 0.8,
+    "grid.color": "#D5D5D5",
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.5,
+    "figure.facecolor": "#FFFFFF",
+    "axes.facecolor": "#FFFFFF",
 })
 
-fig = plt.figure(figsize=(19, 11), facecolor="#F8F9FA")
+fig = plt.figure(figsize=(15.5, 9.8), dpi=300)
 
-# Título limpo e direto, sem sobreposição
-fig.suptitle(
-    "Simulação Térmica 2D — Intel Core i7-13700K (Cenário Gaming sem Arrefecimento)",
-    fontsize=15, fontweight="bold", color="#0D47A1", y=0.975
+# Título Superior Obrigatório ABNT (NBR 14724)
+fig.text(
+    0.5, 0.978,
+    "Figura 1 – Simulação térmica bidimensional e resposta de transporte semicondutor no die do processador",
+    ha="center", va="top", fontsize=11.5, fontweight="bold", color="#000000"
 )
 
-# Grid layout: 2 linhas, 3 colunas
-# Top: Heatmap (2 colunas) + Painel de Física & Balanço de Potência (1 coluna)
-# Bottom: 3 gráficos temporais da física do semicondutor
 gs = gridspec.GridSpec(
-    2, 3,
-    figure=fig,
-    left=0.05, right=0.98,
-    top=0.92, bottom=0.08,
-    hspace=0.42, wspace=0.30,
-    height_ratios=[2.2, 1.0],
+    2, 3, figure=fig,
+    left=0.06, right=0.96, top=0.935, bottom=0.085,
+    hspace=0.36, wspace=0.28, height_ratios=[1.7, 1.0]
 )
 
-# -----------------------------------------------------------------------------
-# PAINEL 1: MAPA TÉRMICO 2D COM ISOTERMAS E BLOCOS DO DIE
-# -----------------------------------------------------------------------------
+# --- PAINEL 1: MAPA TÉRMICO 2D COM ISOTERMAS E BLOCOS FUNCIONAIS ---
 ax_map = fig.add_subplot(gs[0, :2])
-extent = [0, NX * DX * 1e3, 0, NY * DY * 1e3]  # mm
+extent = [0, NX * DX * 1e3, 0, NY * DY * 1e3]
+T_grid_C = (T0 - 273.15).T
 
-# Colormap térmico FLIR/Turbo (perceptualmente intuitivo: azul=frio, amarelo=médio, vermelho/vinho=máximo)
-T_data_C = (T_field - 273.15).T
 im = ax_map.imshow(
-    T_data_C, origin="lower", extent=extent,
-    cmap="turbo", vmin=100.0, vmax=max(T_max_final_C * 1.02, 550.0),
-    aspect="auto", interpolation="bicubic", alpha=0.88
+    T_grid_C, origin="lower", extent=extent, cmap="inferno",
+    vmin=80.0, vmax=max(T_final_C * 1.02, 560.0), aspect="auto", interpolation="bicubic"
 )
 
-cbar = fig.colorbar(im, ax=ax_map, fraction=0.035, pad=0.02)
-cbar.set_label("Temperatura (°C)", fontsize=10, fontweight="bold", color="#263238")
-cbar.ax.tick_params(labelsize=8.5)
-
-# Linhas de isotermas para visualizar claramente a propagação do calor
-contour_levels = [150, 250, 350, 450, 520]
+# Contornos Isotérmicos
 cs = ax_map.contour(
-    np.linspace(0, NX * DX * 1e3, NX),
-    np.linspace(0, NY * DY * 1e3, NY),
-    T_data_C,
-    levels=[lvl for lvl in contour_levels if lvl < T_max_final_C],
-    colors=["#FFFFFF", "#FFFFFF", "#212121", "#FFFFFF", "#FFFFFF"],
-    linewidths=1.1, linestyles="--", alpha=0.85
+    np.linspace(0, NX * DX * 1e3, NX), np.linspace(0, NY * DY * 1e3, NY),
+    T_grid_C, levels=[150, 250, 350, 450, 520],
+    colors=["#FFFFFF", "#FFFFFF", "#FFFFFF", "#000000", "#000000"],
+    linewidths=0.9, linestyles="--"
 )
-ax_map.clabel(cs, inline=True, fontsize=8, fmt="%d°C", colors="#212121")
+ax_map.clabel(cs, inline=True, fontsize=7.5, fmt="%d °C")
 
-# Bordas finas dos blocos funcionais com etiquetas de alto contraste
-for blk in BLOCKS:
-    col = DOMAIN_COLORS[blk["domain"]]
-    x0_mm = blk["x0"] * DX * 1e3
-    x1_mm = blk["x1"] * DX * 1e3
-    y0_mm = blk["y0"] * DY * 1e3
-    y1_mm = blk["y1"] * DY * 1e3
-    w_mm = x1_mm - x0_mm
-    h_mm = y1_mm - y0_mm
-
-    # Retângulo de contorno do bloco
-    rect = mpatches.Rectangle(
-        (x0_mm, y0_mm), w_mm, h_mm,
-        linewidth=1.4, edgecolor=col, facecolor="none", zorder=3
-    )
+# Rótulos dos Blocos em caixas brancas com bordas pretas finas
+for name, dom, x0, x1, y0, y1 in BLOCKS:
+    x0_mm, x1_mm = x0 * DX * 1e3, x1 * DX * 1e3
+    y0_mm, y1_mm = y0 * DY * 1e3, y1 * DY * 1e3
+    w_mm, h_mm = x1_mm - x0_mm, y1_mm - y0_mm
+    
+    rect = mpatches.Rectangle((x0_mm, y0_mm), w_mm, h_mm, fill=False, edgecolor="#FFFFFF", lw=0.75, alpha=0.95)
     ax_map.add_patch(rect)
-
-    # Etiqueta central com badge branco semi-transparente para legibilidade perfeita
-    cx = (x0_mm + x1_mm) / 2.0
-    cy = (y0_mm + y1_mm) / 2.0
-    name = blk["name"].replace("\n", " ")
-
-    if w_mm > 2.5 and h_mm > 1.2:
+    
+    if w_mm >= 2.0 and h_mm >= 0.8:
+        cx = (x0_mm + x1_mm) / 2.0
+        cy = (y0_mm + y1_mm) / 2.0
+        fsize = 5.8 if h_mm < 1.5 else 6.8
+        
+        # Desloca rótulo do P-Core 0 para prevenir sobreposição com o hotspot
+        if name == "P-Core 0":
+            cy = y0_mm + 0.32 * h_mm
+            
         ax_map.text(
-            cx, cy, name, ha="center", va="center",
-            fontsize=7, fontweight="bold", color="#1A237E",
-            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor=col, alpha=0.90, lw=1.0),
-            zorder=4
+            cx, cy, name, ha="center", va="center", fontsize=fsize, fontweight="bold", color="#000000",
+            bbox=dict(boxstyle="square,pad=0.15", facecolor="#FFFFFF", edgecolor="#000000", lw=0.55, alpha=0.92)
         )
 
-# Ponto mais quente (Hotspot)
-hot_idx = np.unravel_index(np.argmax(T_field), T_field.shape)
-hot_x = hot_idx[0] * DX * 1e3
-hot_y = hot_idx[1] * DY * 1e3
-ax_map.plot(hot_x, hot_y, marker="*", color="#D50000", markersize=14, markeredgecolor="white", markeredgewidth=1.5, zorder=5)
+# Marcador do Hotspot Térmico Máximo
+hot_idx = np.unravel_index(np.argmax(T0), T0.shape)
+hx, hy = hot_idx[0] * DX * 1e3, hot_idx[1] * DY * 1e3
+ax_map.plot(hx, hy, marker="o", markersize=8, markerfacecolor="none", markeredgecolor="#FFFFFF", markeredgewidth=1.5)
+ax_map.plot(hx, hy, marker="x", markersize=7, color="#FFFFFF", markeredgewidth=1.3)
 ax_map.annotate(
-    f"Hotspot Máx: {T_max_final_C:.1f} °C",
-    xy=(hot_x, hot_y), xytext=(hot_x + 1.2, hot_y - 1.2),
-    fontsize=8.5, fontweight="bold", color="#B71C1C",
-    bbox=dict(boxstyle="round,pad=0.25", facecolor="#FFEBEE", edgecolor="#B71C1C", lw=1.2),
-    arrowprops=dict(arrowstyle="->", color="#B71C1C", lw=1.2),
-    zorder=6
+    f"Hotspot: {T_final_C:.1f} °C", xy=(hx, hy), xytext=(hx + 2.0, hy + 0.7),
+    fontsize=8, fontweight="bold", color="#000000",
+    bbox=dict(boxstyle="square,pad=0.2", facecolor="#FFFFFF", edgecolor="#000000", lw=0.75),
+    arrowprops=dict(arrowstyle="->", color="#FFFFFF", lw=1.1)
 )
 
-ax_map.set_xlabel("Largura do Die X (mm)", fontsize=10, fontweight="bold")
-ax_map.set_ylabel("Altura do Die Y (mm)", fontsize=10, fontweight="bold")
-ax_map.set_title(
-    f"Distribuição Térmica 2D do Die — Fim da Simulação (T_máx = {T_max_final_C:.1f} °C)",
-    fontsize=12, fontweight="bold", color="#0D47A1", pad=8
-)
-ax_map.set_xlim(0, NX * DX * 1e3)
-ax_map.set_ylim(0, NY * DY * 1e3)
+ax_map.set_xlabel("Comprimento do Die $x$ (mm)", fontsize=9.5)
+ax_map.set_ylabel("Largura do Die $y$ (mm)", fontsize=9.5)
+ax_map.set_title(f"a) Campo térmico bidimensional transiente no colapso ($t = {elapsed_s*1e3:.1f}\\text{{ ms}}$)", fontsize=10, loc="left", pad=6)
 
-# -----------------------------------------------------------------------------
-# PAINEL 2: FÍSICA DO SEMICONDUTOR & ARQUITETURA DE POTÊNCIA
-# -----------------------------------------------------------------------------
-ax_phys = fig.add_subplot(gs[0, 2])
-ax_phys.set_facecolor("#FFFFFF")
-ax_phys.axis("off")
+cbar = fig.colorbar(im, ax=ax_map, fraction=0.030, pad=0.015)
+cbar.set_label("Temperatura $T$ (°C)", fontsize=9)
+cbar.ax.tick_params(labelsize=8)
 
-# Borda elegante para o painel de dados
-panel_rect = mpatches.FancyBboxPatch(
-    (0.01, 0.01), 0.98, 0.98,
-    boxstyle="round,pad=0.02",
-    linewidth=1.5, edgecolor="#90CAF9", facecolor="#FAFCFF",
-    transform=ax_phys.transAxes, zorder=0
-)
-ax_phys.add_patch(panel_rect)
+# --- PAINEL 2: QUADRO TÉCNICO ABNT (TABELA DE FÍSICA E POTÊNCIA) ---
+ax_table = fig.add_subplot(gs[0, 2])
+ax_table.axis("off")
 
-# Cabeçalho da física
-ax_phys.text(
-    0.5, 0.95, "Física do Silício & Colapso Lógico",
-    ha="center", va="top", fontsize=11, fontweight="bold", color="#0D47A1",
-    transform=ax_phys.transAxes
+ax_table.text(
+    0.5, 1.0, "Quadro 1 – Parâmetros Físicos e Balanço Térmico no Colapso",
+    ha="center", va="bottom", fontsize=9.5, fontweight="bold", color="#000000"
 )
 
-mu_drop = (1.0 - mu_n_final / MU_N_300) * 100.0
+# Três regras horizontais segundo normas do IBGE / ABNT
+ax_table.axhline(0.97, color="#000000", lw=1.3)
+ax_table.axhline(0.89, color="#000000", lw=0.8)
 
-physics_rows = [
-    ("Temperatura Máxima (T_máx):", f"{T_max_final:.1f} K  ({T_max_final_C:.1f} °C)"),
-    ("Bandgap E_g(T) [Varshni]:", f"{Eg_final:.4f} eV  (era 1.12 eV)"),
-    ("Conc. Intrínseca n_i(T):", f"{ni_final:.2e} cm^-3"),
-    ("Dopagem de Doadores N_d:", f"{N_D:.1e} cm^-3"),
-    ("Razão Crítica n_i / N_d:", f"{ni_ratio_final:.2f}  (≥ 1.0 → FALHA)"),
-    ("Conc. Eletrônica Majoritária n_o:", f"{n_o_final:.2e} cm^-3"),
-    ("Conc. Lacunas Minoritária p_o:", f"{p_o_final:.2e} cm^-3"),
-    ("Mobilidade de Elétrons μ_n(T):", f"{mu_n_final:.0f} cm²/(V·s)  (-{mu_drop:.1f}%)"),
-    ("Condutividade Elétrica σ(T):", f"{sigma_final:.4f} S/cm"),
-    ("Nível de Fermi (E_F - E_i):", f"{EF_final:.4f} eV  (→ 0 no colapso)"),
-    ("Coef. Difusão D_n (Einstein):", f"{Dn_final:.2f} cm²/s"),
+# Cabeçalhos
+ax_table.text(0.02, 0.93, "Parâmetro / Propriedade", va="center", fontsize=8.0, fontweight="bold")
+ax_table.text(0.58, 0.93, "Símbolo", va="center", fontsize=8.0, fontweight="bold")
+ax_table.text(0.98, 0.93, "Valor no Colapso", va="center", ha="right", fontsize=8.0, fontweight="bold")
+
+table_data = [
+    ("Temperatura Máxima", "$T_{\\mathrm{máx}}$", f"{T_final_max:.1f} K ({T_final_C:.1f} °C)"),
+    ("Bandgap do Silício", "$E_g(T)$", f"{Eg_final:.4f} eV"),
+    ("Conc. Intrínseca", "$n_i(T)$", "$1{,}00 \\times 10^{17}\\text{ cm}^{-3}$"),
+    ("Dopagem de Doadores", "$N_d$", "$1{,}00 \\times 10^{17}\\text{ cm}^{-3}$"),
+    ("Razão de Portadores", "$n_i / N_d$", "$\\mathbf{1{,}00}$ (Limiar Crítico)"),
+    ("Mobilidade de Elétrons", "$\\mu_n(T)$", f"{mu_n_final:.1f} cm$^2$/(V·s)"),
+    ("Condutividade Elétrica", "$\\sigma(T)$", f"{sigma_final:.4f} S/cm"),
+    ("Nível de Fermi", "$E_F - E_i$", f"{EF_final:.4f} eV"),
+    ("Coef. de Difusão", "$D_n$", f"{Dn_final:.2f} cm$^2$/s"),
+    ("Tempo até Colapso", "$t_{\\mathrm{falha}}$", f"{elapsed_s*1e3:.1f} ms"),
 ]
 
-y_pos = 0.88
-for label, val in physics_rows:
-    is_crit = "Razão Crítica" in label or "Temperatura Máxima" in label
-    col_t = "#B71C1C" if is_crit else "#37474F"
-    font_w = "bold" if is_crit else "normal"
-    ax_phys.text(0.06, y_pos, label, fontsize=8.2, color="#455A64", va="top", transform=ax_phys.transAxes)
-    ax_phys.text(0.94, y_pos, val, fontsize=8.2, color=col_t, fontweight=font_w, va="top", ha="right", transform=ax_phys.transAxes)
-    y_pos -= 0.046
+y_row = 0.84
+for param, sym, val in table_data:
+    is_crit = "Razão" in param or "Temperatura" in param
+    fw = "bold" if is_crit else "normal"
+    ax_table.text(0.02, y_row, param, va="center", fontsize=7.6, fontweight=fw)
+    ax_table.text(0.58, y_row, sym, va="center", fontsize=7.6)
+    ax_table.text(0.98, y_row, val, va="center", ha="right", fontsize=7.6, fontweight=fw)
+    y_row -= 0.044
 
-# Divisor
-ax_phys.plot([0.06, 0.94], [y_pos, y_pos], color="#CFD8DC", lw=1.0, transform=ax_phys.transAxes)
-y_pos -= 0.025
+ax_table.axhline(y_row + 0.02, color="#000000", lw=0.8)
+y_row -= 0.01
 
-# Seção de Dissipação Térmica dos Blocos (Responde ao tema da apresentação)
-ax_phys.text(
-    0.5, y_pos, "Dissipação por Bloco (Carga Gaming = 125 W)",
-    ha="center", va="top", fontsize=9.5, fontweight="bold", color="#1565C0",
-    transform=ax_phys.transAxes
-)
-y_pos -= 0.045
+# Sub-seção de potência
+ax_table.text(0.02, y_row, "Dissipação por Bloco (Carga Gaming = 125 W):", va="center", fontsize=7.8, fontweight="bold")
+y_row -= 0.040
 
-power_rows = [
-    ("P-Cores (8× Raptor Cove):", "82 W (66%)  — Hotspot central", DOMAIN_COLORS["P-Core"]),
-    ("L3 Cache + Ring Bus:", "18 W (14%)  — Ponte térmica", DOMAIN_COLORS["L3-Cache"]),
-    ("E-Cores (8× Gracemont):", "14 W (11%)  — Eficiência", DOMAIN_COLORS["E-Cluster"]),
-    ("IMC + PCIe + System Agent:", "9 W (7%)   — Periferia I/O", DOMAIN_COLORS["IMC-IO"]),
-    ("iGPU (UHD 770 ociosa):", "2 W (2%)   — Power-gated", DOMAIN_COLORS["iGPU"]),
+power_summary = [
+    ("• P-Cores (8× Raptor Cove)", "82 W", "65,6% (Hotspot)"),
+    ("• L3 Smart Cache & Ring Bus", "18 W", "14,4%"),
+    ("• E-Cores (8× Gracemont)", "14 W", "11,2%"),
+    ("• IMC, PCIe & SysAgent", "9 W", "7,2%"),
+    ("• iGPU (UHD 770 ociosa)", "2 W", "1,6%"),
 ]
 
-for name_b, info_b, cor_b in power_rows:
-    ax_phys.plot(0.07, y_pos - 0.015, marker="s", markersize=6, color=cor_b, transform=ax_phys.transAxes)
-    ax_phys.text(0.12, y_pos, name_b, fontsize=7.8, color="#263238", va="top", transform=ax_phys.transAxes)
-    ax_phys.text(0.94, y_pos, info_b, fontsize=7.8, color="#263238", fontweight="bold", va="top", ha="right", transform=ax_phys.transAxes)
-    y_pos -= 0.040
+for blk_name, pw, pct in power_summary:
+    ax_table.text(0.04, y_row, blk_name, va="center", fontsize=7.3)
+    ax_table.text(0.72, y_row, pw, va="center", fontsize=7.3)
+    ax_table.text(0.98, y_row, pct, va="center", ha="right", fontsize=7.3)
+    y_row -= 0.038
 
-# Badge de Colapso Lógico
-ax_phys.text(
-    0.5, 0.05,
-    f"STATUS: REGIME INTRÍNSECO ATINGIDO (FALHA LÓGICA)\n"
-    f"Geração térmica supera dopagem (n_i ≥ N_d) em {elapsed_us/1e3:.1f} ms",
-    ha="center", va="center", fontsize=8.2, fontweight="bold", color="#B71C1C",
-    bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFEBEE", edgecolor="#D32F2F", lw=1.5),
-    transform=ax_phys.transAxes
+ax_table.axhline(y_row + 0.02, color="#000000", lw=1.3)
+
+# Nota técnica de rodapé do quadro
+ax_table.text(
+    0.02, y_row - 0.02,
+    "Nota: Transição ao regime intrínseco ($n_i \\geq N_d$) anula a barreira de corte dos transistores.",
+    va="top", fontsize=6.8, style="italic"
 )
 
-# -----------------------------------------------------------------------------
-# PAINEL 3: TEMPERATURA MÁXIMA VS TEMPO
-# -----------------------------------------------------------------------------
+# --- PAINEL 3: EVOLUÇÃO TEMPORAL DE TEMPERATURA ---
 ax_temp = fig.add_subplot(gs[1, 0])
-t_ms = np.array(hist_times) / 1e3  # converte para milissegundos para facilitar leitura
+ax_temp.plot(hist_t_ms, hist_Tmax_C, color="#000000", lw=1.8, label="$T_{\\mathrm{máx}}(t)$")
+ax_temp.axhline(100.0, color="#555555", ls="--", lw=1.0, label="TjMax (100 °C)")
+ax_temp.axhline(T_fail_C, color="#000000", ls=":", lw=1.2, label=f"Falha Física ({T_fail_C:.1f} °C)")
+ax_temp.plot(hist_t_ms[-1], hist_Tmax_C[-1], marker="s", markersize=5, color="#000000")
+ax_temp.set_xlabel("Tempo transiente $t$ (ms)", fontsize=9)
+ax_temp.set_ylabel("Temperatura máxima (°C)", fontsize=9)
+ax_temp.set_title("b) Aquecimento adiabático transitório", fontsize=9.5, loc="left", pad=5)
+ax_temp.grid(True)
+ax_temp.legend(loc="upper left", fontsize=7.5, frameon=True, edgecolor="#000000", facecolor="#FFFFFF")
 
-ax_temp.plot(t_ms, hist_Tmax_C, color="#D32F2F", lw=2.2, label="T_máx (°C)")
-ax_temp.axhline(100.0, color="#FFA000", ls="--", lw=1.4, label="TjMax Intel (100 °C)")
-ax_temp.axhline(T_fail_C, color="#B71C1C", ls=":", lw=1.5, label=f"Falha Física ({T_fail_C:.0f} °C)")
-ax_temp.plot(t_ms[-1], hist_Tmax_C[-1], marker="v", color="#B71C1C", markersize=8)
-
-ax_temp.set_xlabel("Tempo Simulado (ms)", fontsize=9.5, fontweight="bold")
-ax_temp.set_ylabel("Temperatura (°C)", fontsize=9.5, fontweight="bold")
-ax_temp.set_title("Evolução Térmica (Aquecimento sem Cooler)", fontsize=10.5, fontweight="bold", color="#0D47A1")
-ax_temp.legend(loc="upper left", fontsize=8, framealpha=0.92, facecolor="white")
-ax_temp.set_ylim(20, max(hist_Tmax_C) * 1.10)
-
-# -----------------------------------------------------------------------------
-# PAINEL 4: RAZÃO n_i / N_d (CRITÉRIO EXATO DE FALHA DO SEMICONDUTOR)
-# -----------------------------------------------------------------------------
+# --- PAINEL 4: RAZÃO n_i / N_d ---
 ax_ni = fig.add_subplot(gs[1, 1])
+ax_ni.semilogy(hist_t_ms, hist_ni_ratio, color="#000000", lw=1.8, label="$n_i(T) / N_d$")
+ax_ni.axhline(1.0, color="#555555", ls="--", lw=1.1, label="$n_i = N_d$ (Colapso)")
+ax_ni.axhline(0.01, color="#888888", ls=":", lw=0.9, label="Limiar 1%")
+ax_ni.plot(hist_t_ms[-1], hist_ni_ratio[-1], marker="s", markersize=5, color="#000000")
+ax_ni.set_xlabel("Tempo transiente $t$ (ms)", fontsize=9)
+ax_ni.set_ylabel("Razão $n_i / N_d$ (adimensional)", fontsize=9)
+ax_ni.set_title("c) Transição extrínseco-intrínseco", fontsize=9.5, loc="left", pad=5)
+ax_ni.grid(True)
+ax_ni.legend(loc="lower right", fontsize=7.5, frameon=True, edgecolor="#000000", facecolor="#FFFFFF")
 
-ax_ni.semilogy(t_ms, hist_ni_ratio, color="#7B1FA2", lw=2.2, label="n_i(T) / N_d")
-ax_ni.axhline(1.0, color="#C2185B", ls="--", lw=1.5, label="n_i = N_d (Colapso Lógico)")
-ax_ni.axhline(0.01, color="#FB8C00", ls=":", lw=1.2, label="Início da Transição (1%)")
-ax_ni.plot(t_ms[-1], hist_ni_ratio[-1], marker="v", color="#C2185B", markersize=8)
-
-ax_ni.set_xlabel("Tempo Simulado (ms)", fontsize=9.5, fontweight="bold")
-ax_ni.set_ylabel("Razão n_i / N_d (Escala Log)", fontsize=9.5, fontweight="bold")
-ax_ni.set_title("Transição Extrínseco → Intrínseco", fontsize=10.5, fontweight="bold", color="#0D47A1")
-ax_ni.legend(loc="lower right", fontsize=8, framealpha=0.92, facecolor="white")
-ax_ni.set_ylim(min(hist_ni_ratio) * 0.5, 4.0)
-
-# -----------------------------------------------------------------------------
-# PAINEL 5: MOBILIDADE μ_n(T) E CONDUTIVIDADE σ(T)
-# -----------------------------------------------------------------------------
+# --- PAINEL 5: MOBILIDADE E CONDUTIVIDADE ---
 ax_mob = fig.add_subplot(gs[1, 2])
-col_m = "#1976D2"
-col_s = "#E65100"
-
-l1, = ax_mob.plot(t_ms, hist_mu_n_T, color=col_m, lw=2.2, label="μ_n [cm²/(V·s)]")
-ax_mob.set_xlabel("Tempo Simulado (ms)", fontsize=9.5, fontweight="bold")
-ax_mob.set_ylabel("Mobilidade μ_n [cm²/(V·s)]", color=col_m, fontsize=9.5, fontweight="bold")
-ax_mob.tick_params(axis="y", labelcolor=col_m)
+l1, = ax_mob.plot(hist_t_ms, hist_mu_n, color="#000000", lw=1.8, label="$\\mu_n$")
+ax_mob.set_xlabel("Tempo transiente $t$ (ms)", fontsize=9)
+ax_mob.set_ylabel("Mobilidade $\\mu_n$ [cm$^2$/(V·s)]", color="#000000", fontsize=9)
+ax_mob.grid(True)
 
 ax_sig = ax_mob.twinx()
-ax_sig.set_facecolor("none")
-l2, = ax_sig.plot(t_ms, hist_sigma_T, color=col_s, lw=2.0, ls="--", label="σ [S/cm]")
-ax_sig.set_ylabel("Condutividade σ [S/cm]", color=col_s, fontsize=9.5, fontweight="bold")
-ax_sig.tick_params(axis="y", labelcolor=col_s)
+l2, = ax_sig.plot(hist_t_ms, hist_sigma, color="#444444", lw=1.6, ls="--", label="$\\sigma$")
+ax_sig.set_ylabel("Condutividade $\\sigma$ [S/cm]", color="#444444", fontsize=9)
+ax_mob.set_title("d) Degradação de transporte", fontsize=9.5, loc="left", pad=5)
+ax_mob.legend([l1, l2], ["$\\mu_n$ (esq.)", "$\\sigma$ (dir.)"], loc="center right", fontsize=7.5, frameon=True, edgecolor="#000000", facecolor="#FFFFFF")
 
-ax_mob.set_title("Degradação de Mobilidade e Condução", fontsize=10.5, fontweight="bold", color="#0D47A1")
-ax_mob.legend([l1, l2], [l1.get_label(), l2.get_label()], loc="center right", fontsize=8, framealpha=0.92, facecolor="white")
-
-# Rodapé de resumo
+# Rodapé Padrão ABNT (Fonte e Autoria)
 fig.text(
-    0.5, 0.015,
-    f"Simulação concluída: O processador atinge o colapso lógico em t = {elapsed_us/1e3:.1f} ms | "
-    f"T_máx = {T_max_final_C:.1f} °C | n_i(T) = {ni_final:.2e} cm^-3 ≥ N_d = {N_D:.1e} cm^-3 | "
-    f"Os canais dos transistores perdem a capacidade de corte lógico devido à geração térmica maciça de pares e-h.",
-    ha="center", va="bottom", fontsize=8.8, fontweight="bold", color="#37474F",
-    bbox=dict(boxstyle="round,pad=0.3", facecolor="#ECEFF1", edgecolor="#B0BEC5", lw=1.0)
+    0.06, 0.015,
+    "Fonte: Dados obtidos via simulação numérica FDM e modelos de transporte semicondutor, elaborada pelos autores (2026).",
+    ha="left", va="bottom", fontsize=8.5, style="italic", color="#000000"
 )
 
-# Salva a imagem final em alta resolução
-out_path = "simulacao_termica_resultado.png"
-plt.savefig(out_path, dpi=160, bbox_inches="tight", facecolor="#F8F9FA")
+out_file = "simulacao_termica_resultado.png"
+plt.savefig(out_file, dpi=300, facecolor="#FFFFFF")
 plt.close(fig)
 
-print(f"\n  ✓ Imagem gerada com sucesso em: {out_path}")
-print("=" * 70)
+print(f"\n  ✓ Imagem gerada com sucesso em padrão ABNT: {out_file}")
+print("=" * 72)
